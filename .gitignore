@@ -1,0 +1,22 @@
+# API keys / secrets
+.env
+*.key
+
+# Downloaded challenge files and real flags
+challenge/*
+!challenge/.gitkeep
+
+# Agent run logs (may contain challenge solutions)
+workspace/*.json
+!workspace/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
