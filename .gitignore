@@ -20,3 +20,5 @@ venv/
 # OS junk
 .DS_Store
 Thumbs.db
+# Nested challenge repo used by the agent
+workspace/challenge/
