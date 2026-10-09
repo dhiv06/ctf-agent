@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from tools import run_command, submit_flag
+from tools import run_command, send_to_server, submit_flag
 
 HERE = Path(__file__).parent
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -29,6 +29,26 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {"command": {"type": "string", "description": "Shell command to run."}},
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_to_server",
+            "description": (
+                "Connect to a TCP server (used for netcat-style challenges), read its initial output, "
+                "send one line of input, and read the response. Use this instead of run_command for "
+                "challenges that give a `nc host port` connection string."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP of the server."},
+                    "port": {"type": "integer", "description": "TCP port."},
+                    "message": {"type": "string", "description": "One line of input to send (a newline is appended)."},
+                },
+                "required": ["host", "port", "message"],
             },
         },
     },
@@ -139,6 +159,12 @@ def main() -> int:
                     command = arguments.get("command", "")
                     print(f"[run_command] {command}")
                     result = run_command(command)
+                elif name == "send_to_server":
+                    host = arguments.get("host", "")
+                    port = arguments.get("port", 0)
+                    message = arguments.get("message", "")
+                    print(f"[send_to_server] {host}:{port} <- {message!r}")
+                    result = send_to_server(host, port, message)
                 elif name == "submit_flag":
                     print(f"[submit_flag] {arguments.get('flag', '')}")
                     outcome = submit_flag(arguments.get("flag", ""), args.flag)
