@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 
-from tools import run_command, send_to_server, submit_flag
+from tools import request_hint, run_command, send_to_server, submit_flag
 
 HERE = Path(__file__).parent
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -46,9 +46,11 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "host": {"type": "string", "description": "Hostname or IP of the server."},
                     "port": {"type": "integer", "description": "TCP port."},
-                    "message": {"type": "string", "description": "One line of input to send (a newline is appended)."},
+                    "message": {"type": "string", "description": "One line of input to send (a newline is appended). Must be a literal string, not an expression."},
+                    "messages": {"type": "array", "items": {"type": "string"}, "description": "Optional. Several lines to send IN ORDER on ONE connection (replaces `message`). Every call opens a brand-new connection that starts from the beginning, so for multi-step servers replay your earlier correct answers first, then add the next one."},
+                    "repeat": {"type": "integer", "description": "Optional. Send `message` repeated this many times back-to-back (e.g. message \"a\", repeat 500). Use this instead of writing very long strings."},
                 },
-                "required": ["host", "port", "message"],
+                "required": ["host", "port"],
             },
         },
     },
@@ -61,6 +63,21 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {"flag": {"type": "string", "description": "The candidate flag."}},
                 "required": ["flag"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_hint",
+            "description": (
+                "Ask the human operator for a hint. Use only when genuinely stuck: after several clearly "
+                "different approaches have failed. If no hint is ready, the run pauses until one is provided."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string", "description": "What you tried and where you are stuck."}},
+                "required": [],
             },
         },
     },
@@ -82,11 +99,14 @@ def save_log(path: str, meta: dict, steps: list) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Autonomous CTF solving agent (Groq).")
     parser.add_argument("--description", required=True, help="Challenge description given to the agent.")
-    parser.add_argument("--flag", required=True, help="Known correct flag used to validate submissions.")
+    parser.add_argument("--flag", default="",
+                        help="Known correct flag used to validate submissions (optional; if omitted, any valid-format flag ends the run).")
     parser.add_argument("--max-steps", type=int, default=20, help="Maximum model turns (default 20).")
     parser.add_argument("--model", default=os.environ.get("GROQ_MODEL", DEFAULT_MODEL),
                         help=f"Groq model ID (default {DEFAULT_MODEL}, or $GROQ_MODEL).")
     parser.add_argument("--log", default="run_log.json", help="Path of the JSON log file.")
+    parser.add_argument("--hint-file", default="",
+                        help="File the operator writes a hint into. The agent reads it only when it calls request_hint.")
     args = parser.parse_args()
 
     client = OpenAI(base_url=GROQ_BASE_URL, api_key=require_env("GROQ_API_KEY"))
@@ -108,12 +128,24 @@ def main() -> int:
     steps: list = []
 
     for step in range(1, args.max_steps + 1):
-        response = client.chat.completions.create(
-            model=deployment,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-        )
+        try:
+            response = client.chat.completions.create(
+                model=deployment,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+            )
+        except BadRequestError as e:
+            # The model emitted a malformed tool call (e.g. an expression instead of a JSON string).
+            print(f"\n=== Step {step} ===\n[model error] {e}")
+            steps.append({"step": step, "reasoning": "", "tool": None, "arguments": None, "result": f"[model error: {e}]"})
+            messages.append({
+                "role": "user",
+                "content": "Your last tool call was rejected as invalid JSON. Tool arguments must be literal JSON values: "
+                           "no expressions like \"a\"*500. For long repeated input use send_to_server's `repeat` field.",
+            })
+            save_log(args.log, meta, steps)
+            continue
         msg = response.choices[0].message
         reasoning = msg.content or ""
         tool_calls = msg.tool_calls or []
@@ -163,14 +195,26 @@ def main() -> int:
                     host = arguments.get("host", "")
                     port = arguments.get("port", 0)
                     message = arguments.get("message", "")
-                    print(f"[send_to_server] {host}:{port} <- {message!r}")
-                    result = send_to_server(host, port, message)
+                    try:
+                        repeat = int(arguments.get("repeat") or 1)
+                    except (TypeError, ValueError):
+                        repeat = 1
+                    message = message * max(1, min(repeat, 100000))
+                    lines = arguments.get("messages")
+                    if not isinstance(lines, list):
+                        lines = None
+                    shown = message if len(message) <= 200 else f"{message[:60]}...[{len(message)} chars]"
+                    print(f"[send_to_server] {host}:{port} <- {lines if lines else shown!r}")
+                    result = send_to_server(host, port, message, messages=lines)
                 elif name == "submit_flag":
                     print(f"[submit_flag] {arguments.get('flag', '')}")
                     outcome = submit_flag(arguments.get("flag", ""), args.flag)
                     result = json.dumps(outcome)
                     if outcome["correct"]:
                         meta["solved"] = True
+                elif name == "request_hint":
+                    print(f"[request_hint] {arguments.get('reason', '')}")
+                    result = request_hint(args.hint_file)
                 else:
                     result = f"[error: unknown tool {name}]"
 

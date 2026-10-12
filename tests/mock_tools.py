@@ -28,7 +28,21 @@ def run_command(command: str) -> str:
     return f"bash: {command.split()[0] if command else ''}: command not found (mock shell)\n"
 
 
+def send_to_server(host: str, port: int, message: str = "", timeout: int = 10, messages=None) -> str:
+    """Fake TCP exchange: canned banner plus an echo of the message. No Docker or network."""
+    return (
+        "--- Initial response ---\n"
+        f"Welcome to the mock server at {host}:{port}\nEnter input:\n"
+        "--- After sending input ---\n"
+        f"You sent: {message}\n"
+    )
+
+
 def submit_flag(flag: str, correct_flag: str = FAKE_FLAG) -> dict:
     # Always checks against the hardcoded fake flag, ignoring whatever --flag was passed.
     ok = (flag or "").strip() == FAKE_FLAG
     return {"correct": ok, "message": "Correct! Challenge solved." if ok else "Incorrect flag."}
+
+
+def request_hint(hint_file: str, wait: int = 0) -> str:
+    return "No hint channel is available in this run. Keep trying on your own."
