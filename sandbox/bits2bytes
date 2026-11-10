@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""bits2bytes FILE [-o OUT] [--lsb] [--invert] [--width N]
+
+Decode a text file of 0s and 1s into bytes. With no options it tries MSB-8, LSB-8, inverted MSB-8,
+and MSB-7 and prints a short preview of each; the best (most printable) is written to OUT
+(default /tmp/bits_out.bin)."""
+import argparse
+import re
+import sys
+
+FLAG = re.compile(rb"(academy|picoCTF)\{[^}]*\}", re.I)
+MAGIC = {b"\x89PNG": "PNG", b"\xff\xd8\xff": "JPEG", b"PK\x03\x04": "zip", b"\x1f\x8b": "gzip",
+         b"%PDF": "PDF", b"\x7fELF": "ELF", b"GIF8": "GIF"}
+
+
+def decode(bits, width, lsb, invert):
+    if invert:
+        bits = bits.translate(str.maketrans("01", "10"))
+    usable = len(bits) - len(bits) % width
+    out = bytearray()
+    for i in range(0, usable, width):
+        chunk = bits[i:i + width]
+        out.append(int(chunk[::-1] if lsb else chunk, 2))
+    return bytes(out)
+
+
+def score(data):
+    return sum(1 for b in data if 32 <= b < 127 or b in (9, 10, 13)) / len(data) if data else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("file")
+    ap.add_argument("-o", "--out", default="/tmp/bits_out.bin")
+    ap.add_argument("--width", type=int, choices=(7, 8))
+    ap.add_argument("--lsb", action="store_true")
+    ap.add_argument("--invert", action="store_true")
+    a = ap.parse_args()
+
+    bits = re.sub(r"[^01]", "", open(a.file, "r", errors="ignore").read())
+    if not bits:
+        sys.exit("no 0/1 characters found in file")
+    print(f"{len(bits)} bits (len % 8 = {len(bits) % 8}, len % 7 = {len(bits) % 7})")
+
+    if a.width or a.lsb or a.invert:
+        variants = [(f"{a.width or 8}-bit {'LSB' if a.lsb else 'MSB'}{' inverted' if a.invert else ''}",
+                    a.width or 8, a.lsb, a.invert)]
+    else:
+        variants = [("8-bit MSB", 8, False, False), ("8-bit LSB", 8, True, False),
+                    ("8-bit MSB inverted", 8, False, True), ("7-bit MSB", 7, False, False)]
+
+    best = None
+    for name, w, lsb, inv in variants:
+        data = decode(bits, w, lsb, inv)
+        sc = score(data)
+        magic = next((n for m, n in MAGIC.items() if data.startswith(m)), None)
+        flags = [m.group(0).decode(errors="replace") for m in FLAG.finditer(data)]
+        print(f"\n[{name}] {len(data)} bytes, {sc:.0%} printable" + (f", magic: {magic}" if magic else ""))
+        print("  preview:", data[:100].decode("latin-1").encode("unicode_escape").decode())
+        for f in flags:
+            print("  FLAG FOUND:", f)
+        rank = (bool(flags), bool(magic), sc)
+        if best is None or rank > best[0]:
+            best = (rank, name, data)
+
+    open(a.out, "wb").write(best[2])
+    print(f"\nbest guess: {best[1]} -> written to {a.out}. Run: triage {a.out}")
+
+
+main()

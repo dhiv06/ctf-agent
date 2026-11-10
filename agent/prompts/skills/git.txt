@@ -1,0 +1,4 @@
+SKILL: GIT / REMOTE-ACCESS CHALLENGES
+- A server may print the flag in "remote:" lines after a git push, in an SSH banner, or in error messages. Read all output carefully, including stderr.
+- For repositories, look beyond the working tree: git log --all, git branch -a, git stash list, git show <commit>, and git diff between commits can reveal removed or earlier versions of files.
+- Use non-interactive options (ssh -o StrictHostKeyChecking=no, git -c ..., sshpass -p) so commands never wait for input.

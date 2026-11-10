@@ -8,7 +8,7 @@ from pathlib import Path
 
 CONTAINER = "ctf-sandbox"
 TIMEOUT_SECONDS = 20
-MAX_OUTPUT_CHARS = 8000
+MAX_OUTPUT_CHARS = 3000
 
 FLAG_RE = re.compile(r"(academy|picoCTF)\{[^}]*\}")
 
@@ -33,13 +33,46 @@ def run_command(command: str) -> str:
         return "[error: docker executable not found on host]"
 
     output = (proc.stdout or "") + (proc.stderr or "")
-    if len(output) > MAX_OUTPUT_CHARS:
-        output = output[:MAX_OUTPUT_CHARS] + f"\n[output truncated at {MAX_OUTPUT_CHARS} chars]"
+    output = cap_output(output)
     if not output.strip():
         output = f"[no output, exit code {proc.returncode}]"
     elif proc.returncode != 0:
         output += f"\n[exit code {proc.returncode}]"
     return output
+
+
+def cap_output(output: str) -> str:
+    """Cap tool output at MAX_OUTPUT_CHARS, keeping the head AND the tail (sorted listings, summaries and
+    error messages often put the interesting part at the end)."""
+    if len(output) <= MAX_OUTPUT_CHARS:
+        return output
+    tail = MAX_OUTPUT_CHARS // 4
+    head = MAX_OUTPUT_CHARS - tail
+    omitted = len(output) - head - tail
+    return f"{output[:head]}\n[... {omitted} chars omitted ...]\n{output[-tail:]}"
+
+
+WORKSPACE = "/workspace"
+
+
+def copy_file(host_path: str) -> str:
+    """Copy a host file into the sandbox's /workspace. Returns the in-container path, or raises RuntimeError."""
+    src = Path(host_path)
+    if not src.is_file():
+        raise RuntimeError(f"challenge file not found: {host_path}")
+    dest = f"{WORKSPACE}/{src.name}"
+    try:
+        proc = subprocess.run(
+            ["docker", "cp", str(src), f"{CONTAINER}:{dest}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("docker executable not found on host")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("docker cp timed out")
+    if proc.returncode != 0:
+        raise RuntimeError(f"docker cp failed: {(proc.stderr or proc.stdout).strip()}")
+    return dest
 
 
 # Runs inside the container. argv: host port messages_json timeout. Reads until the server
@@ -105,8 +138,7 @@ def send_to_server(host: str, port: int, message: str = "", timeout: int = 10, m
         return "[error: docker executable not found on host]"
 
     output = (proc.stdout or "") + (proc.stderr or "")
-    if len(output) > MAX_OUTPUT_CHARS:
-        output = output[:MAX_OUTPUT_CHARS] + f"\n[output truncated at {MAX_OUTPUT_CHARS} chars]"
+    output = cap_output(output)
     if not output.strip():
         output = f"[no output, exit code {proc.returncode}]"
     elif proc.returncode != 0:

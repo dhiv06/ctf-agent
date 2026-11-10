@@ -28,6 +28,10 @@ def run_command(command: str) -> str:
     return f"bash: {command.split()[0] if command else ''}: command not found (mock shell)\n"
 
 
+def copy_file(host_path: str) -> str:
+    return "/workspace/" + str(host_path).replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def send_to_server(host: str, port: int, message: str = "", timeout: int = 10, messages=None) -> str:
     """Fake TCP exchange: canned banner plus an echo of the message. No Docker or network."""
     return (

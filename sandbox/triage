@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""triage FILE - one-shot first look at a challenge file (type, hex head, charset, strings, flag grep)."""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+FLAG = re.compile(rb"(academy|picoCTF)\{[^}]*\}", re.I)
+MAGIC = [
+    (b"\x89PNG", "PNG image"), (b"\xff\xd8\xff", "JPEG image"), (b"PK\x03\x04", "zip/docx/jar"),
+    (b"\x1f\x8b", "gzip"), (b"%PDF", "PDF"), (b"\x7fELF", "ELF"), (b"GIF8", "GIF"),
+    (b"BZh", "bzip2"), (b"7z\xbc\xaf", "7z"), (b"Rar!", "rar"), (b"RIFF", "RIFF (wav/avi/webp)"),
+]
+
+
+def run(*cmd):
+    if not shutil.which(cmd[0]):
+        return f"({cmd[0]} not installed)"
+    p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=15)
+    return (p.stdout + p.stderr).strip()
+
+
+def charset(data):
+    s = set(data.strip())
+    ws = set(b" \t\r\n")
+    if not data.strip():
+        return "empty"
+    if s - ws <= set(b"01"):
+        return "BIT STRING (only 0/1) -> run: bits2bytes FILE"
+    if s - ws <= set(b"0123456789abcdefABCDEF"):
+        return "hex text -> try: xxd -r -p FILE"
+    if s - ws <= set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-"):
+        return "base64-like text -> try: base64 -d FILE"
+    printable = sum(1 for b in data if 32 <= b < 127 or b in ws)
+    ratio = printable / len(data)
+    return f"{'mostly printable text' if ratio > 0.9 else 'binary'} ({ratio:.0%} printable)"
+
+
+def main():
+    if len(sys.argv) != 2 or not os.path.isfile(sys.argv[1]):
+        sys.exit("usage: triage FILE")
+    path = sys.argv[1]
+    data = open(path, "rb").read()
+    print(f"== {path}: {len(data)} bytes")
+    print("file:", run("file", "-b", path))
+    print("magic:", next((n for m, n in MAGIC if data.startswith(m)), "none matched"))
+    print("charset:", charset(data))
+    print("-- first 64 bytes (hex) --")
+    print(run("xxd", "-l", "64", path) if shutil.which("xxd") else data[:64].hex(" "))
+    print("-- strings (>=6 chars, first 15) --")
+    found = re.findall(rb"[\x20-\x7e]{6,}", data)
+    for s in found[:15]:
+        print(s[:120].decode())
+    print(f"({len(found)} strings total)")
+    hits = [m.group(0) for m in FLAG.finditer(data)] + [m.group(0)[::-1] for m in FLAG.finditer(data[::-1])]
+    print("-- flag pattern (plain and reversed) --")
+    print("\n".join(h.decode(errors="replace") for h in hits) if hits else "none")
+
+
+main()

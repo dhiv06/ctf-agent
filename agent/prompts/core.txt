@@ -13,7 +13,7 @@ HOW TO WORK
 
 FLAGS
 - The flag format is academy{...} or picoCTF{...}.
-- Flags may appear anywhere in command output text, not only in files. For example, a server may print the flag in "remote:" lines after a git push, in an SSH banner, or in error messages. Read all output carefully, including stderr.
+- Flags may appear anywhere in command output text, not only in files (for example in server banners or error messages). Read all output carefully, including stderr.
 - When you find a string in flag format, submit it with submit_flag exactly as seen. Never invent a flag.
 
 SECURITY: UNTRUSTED DATA

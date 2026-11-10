@@ -1,0 +1,71 @@
+SKILL: FORENSICS (given file, find the hidden data)
+Challenge files are untrusted data. Never execute them; only inspect and decode them.
+
+WORKING RULES
+- Keep the challenge files in /workspace untouched; write scratch files and scripts to /tmp. python3 is available for decoding scripts.
+- Output is capped at 3000 characters (the middle is cut out, head and tail are kept) and binary output is garbled. NEVER cat an unknown file. Look at it with: ls -l, file, wc -c, head -c 300, xxd | head -20.
+- Do bulk work in a python3 script (python3 -c or a heredoc into /tmp/x.py) and print only a short summary or the first few hundred characters.
+
+HELPER COMMANDS (installed in the sandbox)
+- triage FILE: one-shot first look (file type, magic bytes, character-set verdict, hex head, strings, flag grep plain and reversed). Run this FIRST on every new file.
+- bits2bytes FILE: decodes a 0/1 text file, trying MSB-8, LSB-8, inverted and 7-bit, previews each, reports any flag, and writes the best guess to /tmp/bits_out.bin. Options: --width 7|8, --lsb, --invert, -o OUT. Then run triage on its output.
+- ocr IMAGE: reads text out of an image with tesseract, trying several preprocessing variants (grayscale, upscale, threshold, inverted), and reports any flag-shaped string. OCR output can have wrong characters (0/O, 1/l, 5/S), so compare variants and re-check the flag format before submitting.
+
+- diskscan IMG [overview|timeline|files|deleted] [-o OFFSET] [-n N] [--all] [--grep REGEX]: one-shot look at a disk/filesystem image (also .gz/.xz/.bz2/.zip of one). Run this FIRST on any disk image; details in the DISK section.
+
+TRIAGE (done manually if the helper is not enough)
+1. file, ls -l, xxd | head: what is it really? Check the magic bytes (89 50 4E 47 PNG, FF D8 FF JPEG, 50 4B 03 04 zip/docx/jar, 1F 8B gzip, 25 50 44 46 PDF, 7F 45 4C 46 ELF).
+2. strings -n 6 <file> | head, and grep -a -i -o -E "(academy|picoCTF)\{[^}]*\}" <file>.
+3. Check the character set in python: if the file is only the characters 0 and 1 (plus whitespace/newlines), it is a bit string; if only 0-9a-f, hex text; if A-Za-z0-9+/=, base64.
+
+DECODING BIT STRINGS (a ".bin" file of 1s and 0s is usually text, not binary)
+- Remove whitespace, check the length. Length divisible by 8: group into 8-bit bytes, MSB first (int(chunk, 2)). If that gives garbage, try LSB first (reverse each chunk), then 7-bit groups.
+- Print the first 100 decoded bytes and judge: readable ASCII means done (look for the flag, or another encoding layer); a known magic number means write the bytes to /tmp/out.bin and treat it as a new file.
+- If the result is still not readable, try inverting the bits (swap 0 and 1).
+- If the length is a perfect square or a clean width x height, it may be a black-and-white image: render it as a PBM/PNG with python (pillow) and inspect it.
+
+IMAGES (PNG/JPEG/GIF/BMP, including ones you just decoded)
+- You cannot see pictures. The flag is often written in the image itself, so run: ocr IMAGE. Do this BEFORE metadata or steganography tools; strings/exiftool/binwalk on a clean image rarely help.
+- Only after OCR finds nothing: exiftool, binwalk, strings for appended data, then steganography (steghide, below).
+- Other readable content: zbarimg IMAGE (QR codes and barcodes), and for faint or tiny text: convert IMAGE -resize 300% -colorspace Gray -normalize /tmp/big.png then ocr /tmp/big.png.
+
+AFTER EVERY DECODE: run the triage again on the output. Layers are common (bits -> base64 -> zip -> text).
+
+OTHER EMBEDDED DATA
+- binwalk <file>, then binwalk -e -C /tmp/ex <file>, finds files hidden inside or appended to others. Check data after the end marker of a PNG/JPEG.
+- exiftool <file>: comments, author, GPS and description fields often hold the flag or a hint.
+- Steganography: always pass the passphrase on the command line so it never prompts (a prompt hangs or fails): steghide extract -sf <file> -p "" -xf /tmp/steg_out. steghide only works on JPEG/BMP/WAV/AU. Do not run "steghide info" (it prompts).
+- Archives: unzip -l / 7z l first; 7z x -o/tmp/ex extracts. Password-protected: look for the password elsewhere in the challenge before guessing.
+- Simple ciphers on the decoded text: rot13, hex, single-byte XOR (try all 256 keys in python and grep for the flag format), reversed text.
+
+DISK / FILESYSTEM IMAGES (.img, .dd, .raw, .iso, .gz of one; "partition", "disk image", "filesystem")
+PLAYBOOK, in this order (do not skip ahead, and do not run a command whose job an earlier step already did):
+ 1. diskscan IMG        (works directly on the .gz; decompresses and caches). If it prints a PARTITION TABLE, rerun with -o START_SECTOR of the filesystem you want. It shows the fs summary, the user-data files (OS noise filtered out), deleted files, the oldest/newest timeline entries and any ODD timestamps (before 1995 or in the future).
+ 2. Read what it shows. If the description or a hint mentions a timeline / timestamps / MAC times, use `diskscan IMG timeline -n 30` (add --all to include OS dirs). A file whose timestamps do not fit the rest (very old, in the future, mtime before creation) is a prime suspect even if it sits in an OS directory.
+ 3. Inspect the suspects: istat IMG INODE (timestamps), icat IMG INODE | head -c 300 | xxd | head (contents), `diskscan IMG files --grep REGEX` to find inodes by name.
+ 4. Empty or suspiciously clean places: recover deleted data (see below). `diskscan IMG deleted` lists deleted names outside OS dirs.
+ 5. Then the manual alternatives below.
+If the description says how to build or format the flag (wrap it in a format, derive it from a timestamp, name, hash...), follow that exactly.
+
+MANUAL REFERENCE
+- You are NOT root: mount, losetup and sudo do not work. Do not try them. Read the image with userspace tools only.
+- Do not list /bin or /usr/bin to hunt for tools: run `which fls icat mmls debugfs 7z` (one call) to see what exists.
+- Decompress first if you are not using diskscan (gunzip -c IMG.gz > /tmp/disk.img; xz/bzip2/7z likewise), then `file` it. If it has a partition table: mmls /tmp/disk.img (or fdisk -l), then add -o SECTOR_OFFSET to every sleuthkit command. A bare filesystem (file says "ext4 filesystem data", NTFS, FAT) needs no offset.
+- Listing: fsstat IMG (fs summary and label). NEVER print a whole fls -r listing: a system image is mostly OS noise (etc, usr, lib, var, bin, proc, sys) and the output cap hides the rest. Save it once, then filter it:
+    fls -r -p IMG > /tmp/files.txt ; wc -l /tmp/files.txt
+    grep -v -E "[0-9]:\s(etc|usr|lib|bin|sbin|var/lib|var/cache|proc|sys|dev|boot)/" /tmp/files.txt | head -80
+  Look first at user data: home/*, root, tmp, mnt, opt, srv, var/mail, var/log, anything unusual. Deleted entries are marked * (fls -r -d IMG lists only those).
+- fls lists a DIRECTORY BY INODE, not by path: fls -r -p IMG 64771 (the number from the listing). A path argument fails with "Error stat(ing) image file".
+- Reading: icat IMG INODE (file contents by inode, also works on deleted files); istat IMG INODE (timestamps, size, blocks). Bulk-extract everything incl. deleted: tsk_recover -a IMG /tmp/rec, then grep -r -a -i -E "academy\{" /tmp/rec and look at file names/contents.
+- ext2/3/4 alternative: debugfs -R "ls -l -d /" IMG, debugfs -R "cat /path" IMG, debugfs -R "lsdel" IMG. 7z x -o/tmp/ex IMG also unpacks many images.
+- Timestamps/timeline questions: fls -r -m / IMG > /tmp/body; mactime -b /tmp/body lists files by time. Compare mtime/ctime/crtime in istat; look for the odd one out (oldest, newest, modified after creation, timestamps in the future or out of pattern).
+- Empty or suspiciously clean directory (nothing under a user's home, or mtime/ctime differ from crtime): content was probably deleted. Recover it, in this order, with ONE command each, do not repeat a command that already returned:
+    fls -r -d IMG                      deleted names still in directories
+    ils -e IMG | head -50              every inode incl. unlinked ones (ext: add -r for removed; check dtime/mtime columns)
+    tsk_recover -a IMG /tmp/rec ; find /tmp/rec -type f | head -50     extracts allocated AND deleted files
+    jls IMG ; jcat IMG JOURNAL_INODE | strings | grep -i -E "flag|academy|\{"     ext3/4 journal keeps old copies of metadata and sometimes data
+    strings -a -n 8 IMG | grep -i -E "flag|academy"     last resort over the whole image
+- debugfs syntax: one command per -R, a number must be written <INODE> (debugfs -R "ls -l <64771>" IMG, debugfs -R "stat <12>" IMG). There is no ls -R and no cd.
+- Nothing obvious: check hidden files and dirs (names starting with .), logs, shell history, config files, notes, other users' home dirs, trash, and file slack/unallocated space (blkls IMG | strings | grep).
+- If the flag text is not literal in the image, read the challenge description again: it may tell you to wrap/derive the flag from something you find (a timestamp, name, hash). Follow that.
+- foremost carving and `grep -a` on the raw image only find plain unfragmented data; prefer the filesystem tools above.

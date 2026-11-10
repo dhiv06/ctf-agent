@@ -43,7 +43,8 @@ class FakeClient:
 
 
 def main() -> int:
-    os.environ.setdefault("GROQ_API_KEY", "dummy")
+    # os.environ.setdefault("GROQ_API_KEY", "dummy")
+    os.environ.setdefault("GEMINI_API_KEY", "dummy")
     agent.OpenAI = FakeClient
 
     log = Path(tempfile.mkdtemp()) / "mock_log.json"

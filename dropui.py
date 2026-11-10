@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parent
 CHALLENGE = ROOT / "challenge"
 MAX_UPLOAD = 100 * 1024 * 1024
 RESERVED = {"task.json", "hint.txt", ".gitkeep"}  # written by the form, not by file drops
-IGNORED = RESERVED | {"base64_warmup.txt"}  # never copied to the sandbox or wiped (sanity-test fixture)
+IGNORED = RESERVED | {"base64_warmup.txt", "bits_warmup.bin"}  # never copied to the sandbox or wiped (sanity-test fixtures)
+TASK_KEYS = ("kind", "name", "host", "port", "desc", "flag", "steps", "model")
+# challenge type (the UI toggle) -> prompt skills passed to agent.py --skills
+SKILLS_BY_KIND = {"general": "general,git", "forensics": "general,forensics"}
 CONTAINER = "ctf-sandbox"  # must match agent/tools.py
 WORKDIR = "/workspace"
 HINT_SEP = "\n---\n"  # hints live in hint.txt separated by this; must match agent/tools.py
@@ -161,6 +164,16 @@ PAGE = r"""<!doctype html>
         white-space: pre-wrap; word-break: break-all; color: var(--fg);
         max-height: 420px; overflow: auto; font-size: 13px; }
   [hidden] { display: none !important; }
+  .kinds { display: flex; gap: 0; margin-bottom: 4px; }
+  .kinds button { flex: 1; color: var(--dim); border-color: var(--line); }
+  .kinds button + button { border-left: 0; }
+  .kinds button:hover { color: var(--fg); background: transparent; border-color: var(--dim); }
+  .kinds button.on, .kinds button.on:hover { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+  .only-forensics { display: none; }
+  body[data-kind="forensics"] .only-forensics { display: block; }
+  body[data-kind="forensics"] span.only-forensics { display: inline; }
+  body[data-kind="forensics"] .only-general { display: none; }
+  .need { color: var(--warn); }
   .actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
   @media (max-width: 520px) { .row { flex-direction: column; } .row > div.narrow { flex: 1; } }
@@ -173,9 +186,14 @@ PAGE = r"""<!doctype html>
 
   <section>
     <h2><b>01</b>target</h2>
+    <label>challenge type</label>
+    <div class="kinds">
+      <button type="button" id="kind-general" data-kind="general">general</button>
+      <button type="button" id="kind-forensics" data-kind="forensics">forensics</button>
+    </div>
     <label for="name">ctf / challenge name (used for the log file)</label>
     <input id="name" autocomplete="off" spellcheck="false">
-    <div class="row">
+    <div class="row only-general">
       <div><label for="host">host</label><input id="host" autocomplete="off" spellcheck="false"></div>
       <div class="narrow"><label for="port">port</label><input id="port" type="number" min="1" max="65535"></div>
     </div>
@@ -194,7 +212,7 @@ PAGE = r"""<!doctype html>
   </section>
 
   <section>
-    <h2><b>02</b>files</h2>
+    <h2><b>02</b>files<span class="only-forensics need" style="margin-left:8px;text-transform:none;letter-spacing:0">(required for forensics)</span></h2>
     <div id="drop" tabindex="0">drop challenge files here<small>or click to browse &middot; saved to challenge/</small></div>
     <input id="file" type="file" multiple>
     <div id="confirmBox"></div>
@@ -301,6 +319,20 @@ drop.addEventListener("drop", e => enqueue(e.dataTransfer.files));
 
 // ---- task / hint ----
 const fields = ["name", "host", "port", "desc", "flag", "steps", "model"];
+const DESC_HINT = {
+  general: "",
+  forensics: "paste the challenge text. the file you drop in section 02 is analysed in the sandbox.",
+};
+let kind = "general";
+
+function setKind(k) {
+  kind = k === "forensics" ? "forensics" : "general";
+  document.body.dataset.kind = kind;
+  for (const b of document.querySelectorAll(".kinds button")) b.classList.toggle("on", b.dataset.kind === kind);
+  $("desc").placeholder = DESC_HINT[kind];
+}
+for (const b of document.querySelectorAll(".kinds button")) b.onclick = () => setKind(b.dataset.kind);
+setKind("general");
 
 async function refresh() {
   const s = await (await fetch("/api/state")).json();
@@ -312,7 +344,7 @@ async function refresh() {
 }
 
 function taskObj() {
-  return Object.fromEntries(fields.map(k => [k, $(k).value]));
+  return { kind, ...Object.fromEntries(fields.map(k => [k, $(k).value])) };
 }
 
 // ---- sandbox + run ----
@@ -411,6 +443,7 @@ $("clearHint").onclick = async () => {
 
 (async () => {
   const s = await refresh();
+  setKind(s.task.kind);
   for (const k of fields) if (s.task[k] !== undefined) $(k).value = s.task[k];
   hints = s.hints || [];
   renderHints();
@@ -473,7 +506,7 @@ def build_description(task, hint, files):
         parts.append(f"Challenge files are already in {WORKDIR} inside the sandbox: " + ", ".join(files)
                      + ". Read and analyse them with run_command.")
     host, port = task.get("host", "").strip(), task.get("port", "").strip()
-    if host and port:
+    if host and port and task.get("kind") != "forensics":
         parts.append(f"Server: nc {host} {port}")
     if hint.strip():
         parts.append("Hint from the operator: " + hint.strip())
@@ -559,8 +592,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "invalid json"}, 400)
 
         if path == "/api/task":
-            keys = ("name", "host", "port", "desc", "flag", "steps", "model")
-            task = {k: str(data.get(k, "")) for k in keys}
+            task = {k: str(data.get(k, "")) for k in TASK_KEYS}
+            if task["kind"] not in SKILLS_BY_KIND:
+                task["kind"] = "general"
             (CHALLENGE / "task.json").write_text(json.dumps(task, indent=2), encoding="utf-8")
             return self.send_json({"ok": True})
         if path == "/api/hint":
@@ -582,10 +616,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "agent already running"}, 409)
             if not sandbox_running():
                 return self.send_json({"error": "sandbox is not running - start it first"}, 400)
-            task = {k: str(data.get(k, "")) for k in ("name", "host", "port", "desc", "flag", "steps", "model")}
+            task = {k: str(data.get(k, "")) for k in TASK_KEYS}
+            if task["kind"] not in SKILLS_BY_KIND:
+                task["kind"] = "general"
             if not task["desc"].strip():
                 return self.send_json({"error": "add a challenge description first"}, 400)
             files = list_files()
+            if task["kind"] == "forensics" and not files:
+                return self.send_json({"error": "forensics needs a challenge file - drop it in section 02 first"}, 400)
             for name in files:  # make sure the sandbox has the latest copy of every file
                 ok, msg = copy_to_sandbox(name)
                 if not ok:
@@ -595,7 +633,8 @@ class Handler(BaseHTTPRequestHandler):
             log_path = unique_log_path(task["name"])
             argv = [sys.executable, "-u", str(ROOT / "agent" / "agent.py"),
                     "--description", build_description(task, "", files),
-                    "--log", str(log_path), "--hint-file", str(hint_path)]
+                    "--log", str(log_path), "--hint-file", str(hint_path),
+                    "--skills", SKILLS_BY_KIND[task["kind"]]]
             if task["flag"].strip():
                 argv += ["--flag", task["flag"].strip()]
             if task["steps"].strip().isdigit():

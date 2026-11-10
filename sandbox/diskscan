@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""diskscan IMG [MODE] [-o SECTOR_OFFSET] [-n N] [--all] [--grep REGEX]
+
+One-shot look at a disk / filesystem image with userspace Sleuthkit tools (no mount, no root).
+Accepts raw images and .gz/.xz/.bz2/.zip of one (decompressed once into /tmp/diskscan and cached).
+
+MODE:
+  overview   (default) fs summary, user-data files, deleted files, timeline extremes and odd timestamps
+  timeline   MAC timeline (mactime). Oldest and newest entries; --all includes OS dirs (etc, usr, lib ...)
+  files      non-OS file list (--all includes OS dirs, --grep filters by regex)
+  deleted    deleted entries outside OS dirs
+Heavy results are cached in /tmp/diskscan, so re-running a mode is instant.
+"""
+import argparse
+import csv
+import os
+import re
+import subprocess
+import sys
+import time
+
+WORK = "/tmp/diskscan"
+WIDTH = 118
+# Typical OS / package-manager noise. Everything else is "user data" worth reading first.
+OS_RE = re.compile(r"^(etc|usr|lib|lib32|lib64|bin|sbin|var/lib|var/cache|var/spool|proc|sys|dev|boot|run)(/|$)")
+DECOMPRESS = {".gz": ["gzip", "-dc"], ".xz": ["xz", "-dc"], ".bz2": ["bzip2", "-dc"], ".zip": ["unzip", "-p"]}
+
+
+def clip(s, width=WIDTH):
+    return s if len(s) <= width else s[: width - 3] + "..."
+
+
+def cached(dest, cmd, what):
+    """Run cmd with stdout -> dest (atomically, so an interrupted run leaves no half-written cache)."""
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return
+    os.makedirs(WORK, exist_ok=True)
+    part = dest + ".part"
+    with open(part, "wb") as f:
+        p = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
+    if p.returncode != 0 or os.path.getsize(part) == 0:
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()[:3]
+        os.remove(part)
+        sys.exit(f"[diskscan] {what} failed: {' | '.join(err) or 'no output'}")
+    os.replace(part, dest)
+
+
+def prepare(path):
+    if not os.path.isfile(path):
+        sys.exit(f"[diskscan] not a file: {path}")
+    lower = path.lower()
+    for ext, cmd in DECOMPRESS.items():
+        if lower.endswith(ext):
+            dest = os.path.join(WORK, os.path.basename(path)[: -len(ext)])
+            cached(dest, cmd + [path], f"decompress ({ext})")
+            return dest
+    return path
+
+
+def tag(img, off):
+    return os.path.join(WORK, f"{os.path.basename(img)}.{os.path.getsize(img)}.o{off}")
+
+
+def strip_name(name):
+    name = re.sub(r"\s*\(deleted[^)]*\)\s*$", "", name.lstrip("/"))
+    return name
+
+
+def is_os(path):
+    return bool(OS_RE.match(strip_name(path)))
+
+
+def tsk_off(off):
+    return ["-o", str(off)] if off else []
+
+
+def check_partitions(img, off):
+    """If the image has a partition table and no -o was given, show it and stop."""
+    if off:
+        return
+    p = subprocess.run(["mmls", img], capture_output=True, text=True)
+    if p.returncode == 0 and p.stdout.strip():
+        print("PARTITION TABLE (rerun with -o START_SECTOR of the filesystem you want):")
+        for line in p.stdout.strip().splitlines()[:14]:
+            print(clip(line))
+        sys.exit(0)
+
+
+def fs_summary(img, off):
+    p = subprocess.run(["fsstat"] + tsk_off(off) + [img], capture_output=True, text=True)
+    keys = ("File System Type", "Volume Name", "Volume ID", "Last Written", "Last Mounted", "OS Name",
+            "Block Size", "Block Count", "Inode Count", "Label")
+    lines = [l.strip() for l in p.stdout.splitlines() if l.strip().startswith(keys)]
+    return lines[:8] or [clip((p.stderr.strip().splitlines() or ["fsstat gave no output"])[0])]
+
+
+def load_files(img, off, t):
+    path = t + ".files"
+    cached(path, ["fls", "-r", "-p"] + tsk_off(off) + [img], "fls (file listing)")
+    out = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            head, _, p = line.rstrip("\n").partition("\t")
+            if not p:
+                continue
+            out.append((head.split()[0], " * " in head, p, head))
+    return out  # (type, deleted, path, raw head)
+
+
+def load_timeline(img, off, t):
+    body = t + ".body"
+    cached(body, ["fls", "-r", "-m", "/"] + tsk_off(off) + [img], "fls -m (body file)")
+    csvp = t + ".mactime.csv"
+    cached(csvp, ["mactime", "-b", body, "-d", "-y", "-z", "UTC"], "mactime")
+    rows, cur = [], ""
+    with open(csvp, encoding="utf-8", errors="replace", newline="") as f:
+        for r in csv.reader(f):
+            if len(r) < 8 or r[0] == "Date":
+                continue
+            if r[0]:
+                cur = r[0]
+            rows.append((cur, r[2], r[1], ",".join(r[7:])))  # date, macb, size, name
+    return rows
+
+
+def fmt_row(r):
+    date, macb, size, name = r
+    return clip(f"{date[:19]} {macb:<4} {size:>9} {name}")
+
+
+def odd_times(rows):
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + 86400))
+    return [r for r in rows if r[0][:4].isdigit() and (r[0][:4] < "1995" or r[0][:19] > now)]
+
+
+def show_timeline(rows, n, everything):
+    user = rows if everything else [r for r in rows if not is_os(r[3])]
+    print(f"TIMELINE: {len(rows)} entries ({len(user)} outside OS dirs)")
+    odd = odd_times(rows)
+    if odd:
+        print(f"-- ODD timestamps (before 1995 or in the future): {len(odd)}")
+        for r in odd[:n]:
+            print(fmt_row(r))
+    print(f"-- oldest {n}{'' if everything else ' outside OS dirs'}")
+    for r in user[:n]:
+        print(fmt_row(r))
+    print(f"-- newest {min(n, 5)}")
+    for r in user[-min(n, 5):]:
+        print(fmt_row(r))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="One-shot disk image look (Sleuthkit).")
+    ap.add_argument("image")
+    ap.add_argument("mode", nargs="?", default="overview", choices=["overview", "timeline", "files", "deleted"])
+    ap.add_argument("-o", "--offset", type=int, default=0, help="partition start sector (see the mmls output)")
+    ap.add_argument("-n", type=int, default=0, help="max lines per section")
+    ap.add_argument("--all", action="store_true", help="include OS directories (etc, usr, lib ...)")
+    ap.add_argument("--grep", default="", help="files mode: only paths matching this regex")
+    a = ap.parse_args()
+
+    img = prepare(a.image)
+    check_partitions(img, a.offset)
+    t = tag(img, a.offset)
+
+    if a.mode == "timeline":
+        show_timeline(load_timeline(img, a.offset, t), a.n or 12, a.all)
+    elif a.mode in ("files", "deleted"):
+        files = load_files(img, a.offset, t)
+        rx = re.compile(a.grep) if a.grep else None
+        sel = [f for f in files if (a.all or not is_os(f[2])) and (a.mode == "files" or f[1]) and (not rx or rx.search(f[2]))]
+        print(f"{len(sel)} matching entries (of {len(files)}); showing {min(len(sel), a.n or 40)}")
+        for typ, dele, p, head in sel[: a.n or 40]:
+            print(clip(f"{typ} {'DEL ' if dele else ''}{head.split()[-1].rstrip(':')}  {p}"))
+    else:
+        for line in fs_summary(img, a.offset):
+            print(clip(line))
+        files = load_files(img, a.offset, t)
+        user = [f for f in files if not is_os(f[2])]
+        dele = [f for f in user if f[1]]
+        print(f"FILES: {len(files)} entries, {len(user)} outside OS dirs, {len(dele)} of those deleted")
+        print("-- outside OS dirs (type [DEL] inode path); 'diskscan IMG files -n 80' for more")
+        for typ, d, p, head in user[:20]:
+            print(clip(f"{typ} {'DEL ' if d else ''}{head.split()[-1].rstrip(':')}  {p}"))
+        if dele:
+            print("-- deleted outside OS dirs")
+            for typ, d, p, head in dele[:8]:
+                print(clip(f"{typ} DEL {head.split()[-1].rstrip(':')}  {p}"))
+        show_timeline(load_timeline(img, a.offset, t), 6, False)
+        print("NEXT: icat/istat an interesting inode; 'diskscan IMG timeline -n 30'; tsk_recover -a for deleted data")
+
+
+if __name__ == "__main__":
+    main()

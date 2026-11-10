@@ -1,0 +1,4 @@
+SKILL: GENERAL FILE / ENCODING CHALLENGES
+- Start with ls -l, file, and head -c 200 on any file before reading it in full.
+- Encoded text is common: base64, hex, rot13, URL encoding. Decode one layer at a time and re-inspect the result; the output may be another encoding layer.
+- Search for the flag directly too: grep -a -o -E "(academy|picoCTF)\{[^}]*\}" <file>, and strings <file> | grep -i flag.
