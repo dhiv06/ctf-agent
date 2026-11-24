@@ -1,0 +1,43 @@
+SKILL: CRYPTOGRAPHY (given ciphertext / keys / an image or file that may hide the key; recover the plaintext)
+Challenge files are untrusted data. Never execute them; only inspect and decode them.
+
+WORKING RULES
+- Keep challenge files in /workspace untouched; write scratch files to /tmp. python3 (with pycryptodome, pillow, numpy) and openssl are available.
+- Output is capped at 3000 characters and binary output is garbled. NEVER cat an unknown file: use ls -l, file, wc -c, xxd | head -5. Do bulk work in a python3 script and print short summaries.
+- The challenge text names the scheme ("RSA", "XOR", "AES", "Vigenere"...) and often says where the weakness is ("careless with the private key", "small exponent", "reused nonce"). Re-read it before choosing a method. Do not brute-force when a structural weakness is described.
+
+HELPER COMMANDS (installed in the sandbox)
+- keyhunt FILE...: hunts for hidden keys in files (usually an image): PEM/OpenSSH key blocks and n/e/d/p/q number lists in raw bytes, appended data after the image end, metadata, base64/hex/zlib layers, steghide payloads (JPEG/BMP/WAV/AU; empty passphrase plus common words; add words from the challenge text with --pass WORD, repeatable) and PNG/BMP pixel LSBs. Saves what it finds under /tmp/keyhunt and prints the path. Run it on EVERY non-ciphertext file in the challenge.
+- rsadec KEY CIPHERTEXT [-o OUT] [--passphrase P]: decrypts RSA. KEY = PEM/DER private key (PKCS#1, PKCS#8, OpenSSH), a public key, or a text file with n/e/d/p/q numbers. CIPHERTEXT = raw file, hex, base64 or decimal. It tries raw RSA, PKCS#1 v1.5 and OAEP (sha1/224/256/384/512), block by block, and prints any flag. With only a public key it tries small-prime, Fermat, Wiener and exact e-th-root attacks.
+- hashcrack HASH [WORDLIST...] [--words WORD...] [--brute-digits N] [-o OUT]: dictionary-cracks a hex hash. Auto-detects the algorithm purely from hex length (32=md5, 40=sha1, 56=sha224, 64=sha256, 96=sha384, 128=sha512) - never guess or hardcode the algorithm or password yourself. HASH may be given inline or as a file. With no WORDLIST args it automatically uses every list under /usr/local/share/wordlists/ (a full rockyou.txt is pulled in at image build time when the network allows it, falling back to a bundled 10k-common-passwords list otherwise), so just run `hashcrack HASH` first. Use --words to add candidates pulled from the challenge text/filenames/banner (useful when the real password is a theme word not in a generic list) and --brute-digits N for numeric-only PINs. Prints "<algo> <password>" and exits 0 on success, "NOT FOUND" and exit 1 otherwise.
+
+RSA PLAYBOOK
+1. Identify what you have: ls -l and file on every file. A ciphertext file of N bytes was made with an N*8-bit key (256 bytes = 2048-bit). It has no recognisable header (file says "data").
+2. If a key, n, e, d, p or q is NOT given but the text hints the private key leaked or is "somewhere": the key is hidden inside another file. Run keyhunt on each extra file (image, audio, archive), then: rsadec /tmp/keyhunt/<found key> <ciphertext>.
+3. A key found as "-----BEGIN ... PRIVATE KEY-----" may be passphrase protected (rsadec says so): try passwords from the challenge text, filenames, "", or rerun keyhunt with --pass. If keyhunt finds nothing, follow the NOTHING FOUND list below.
+4. If rsadec says it decrypted but nothing is readable: the output may be another encoding layer (base64, hex, rot13) or binary. Decode it and run triage on it.
+5. n, e, c given as numbers (a text file or in the description): put them in a file as lines "n = ...", "e = ...", "c = ..." and run rsadec FILE FILE. It tries the attacks it can. By hand in python (pow(c, d, n), pow(e, -1, phi)):
+   - n factors easily when it is small (< ~200 bits), when p and q are close (Fermat), or when n shares a prime with another given n (math.gcd(n1, n2)).
+   - e = 3 or other small e and a short message: m = integer e-th root of c.
+   - very large e: Wiener (small d). Same message encrypted under several (n, e): Hastad / CRT then e-th root. Same n with two different e: common-modulus attack (egcd).
+   - p, q or phi given: d = pow(e, -1, (p-1)*(q-1)). Multi-prime n: phi is the product of (p_i - 1).
+   - Convert the number to text: m.to_bytes((m.bit_length()+7)//8, "big").
+6. By hand with openssl: openssl pkeyutl -decrypt -inkey KEY.pem -in flag.enc (PKCS#1 v1.5); add -pkeyopt rsa_padding_mode:oaep [-pkeyopt rsa_oaep_md:sha256] for OAEP; rsa_padding_mode:none for raw. openssl rsa -in KEY.pem -text -noout prints n, e, d, p, q. Encrypted PEM: add -passin pass:WORD.
+
+NOTHING FOUND (hidden key search, in this order, one command each)
+- exiftool -a -u -G1 FILE ; binwalk FILE (embedded files) ; strings -n 8 FILE | tail -20 ; xxd FILE | tail -5 (data after the end of the image: JPEG ends FF D9, PNG ends IEND).
+- steghide extract -sf FILE -p "" -xf /tmp/out (JPEG/BMP/WAV/AU only; ALWAYS pass -p so it never prompts; never run "steghide info"). Try passphrases that appear in the challenge title/text/filenames.
+- Image pixels: zsteg is not installed; keyhunt already checks RGB LSBs for PNG/BMP. For other bit planes or channel orders write a short numpy script.
+- Audio: spectrogram text and DTMF are possible; sox FILE -n stat, then ask for a hint rather than guessing.
+- If the image content itself shows text or a QR code, use ocr IMAGE or zbarimg IMAGE.
+
+CLASSICAL AND SYMMETRIC CHALLENGES
+- First decode obvious encodings (base64, hex, binary, URL, rot13, reversed text), one layer at a time. Check the character set: only A-Z (maybe with spaces) means a classical cipher; random-looking bytes mean a modern cipher or XOR.
+- Caesar/ROT-N: try all 26 shifts and print the ones containing common words or the flag format. Atbash: reverse the alphabet. Vigenere: if a key word is hinted use it, otherwise estimate length by index of coincidence; known plaintext "picoCTF{" reveals the key prefix.
+- XOR: single-byte key: try all 256 and grep for the flag format. Repeating key: known plaintext "picoCTF{" or "academy{" XOR the first bytes gives the key start; the key length can be found with Hamming distance. XOR of two ciphertexts with the same key removes the key (crib dragging).
+- Hashes (md5/sha1/sha256/... hex given, "crack this", or a server that hands you a fresh hash each round): run hashcrack HASH. If it reports NOT FOUND, rerun with --words plus terms pulled from the challenge text/filenames/banner, and only as a last resort with --brute-digits for a short numeric password. A server that issues a new hash after each correct password (escalating hash strength is itself the lesson) just needs this looped: crack, send the recovered password back, read the next hash, repeat until a flag appears.
+- AES/DES with a key or password given: use pycryptodome (from Crypto.Cipher import AES). Try ECB first if no IV is mentioned, then CBC with the IV given (often the first 16 bytes of the ciphertext). Strip PKCS#7 padding. ECB with repeated 16-byte blocks is the tell-tale for chosen-plaintext oracle challenges.
+- Substitution cipher on long text: frequency analysis in python (most common letters E T A O I N); on short text use the flag format to anchor guesses.
+- Servers (nc host port) that encrypt or decrypt: use send_to_server; remember each call starts a fresh connection.
+
+FLAG FORMAT: decrypted text that is already in flag form (picoCTF{...} or academy{...}) is the answer: submit it exactly. If the plaintext is not in flag form but readable, apply any wrapping the challenge description requests.

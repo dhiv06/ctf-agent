@@ -17,7 +17,7 @@ RESERVED = {"task.json", "hint.txt", ".gitkeep"}  # written by the form, not by 
 IGNORED = RESERVED | {"base64_warmup.txt", "bits_warmup.bin"}  # never copied to the sandbox or wiped (sanity-test fixtures)
 TASK_KEYS = ("kind", "name", "host", "port", "desc", "flag", "steps", "model")
 # challenge type (the UI toggle) -> prompt skills passed to agent.py --skills
-SKILLS_BY_KIND = {"general": "general,git", "forensics": "general,forensics"}
+SKILLS_BY_KIND = {"general": "general,git", "forensics": "general,forensics", "cryptography": "general,cryptography"}
 CONTAINER = "ctf-sandbox"  # must match agent/tools.py
 WORKDIR = "/workspace"
 HINT_SEP = "\n---\n"  # hints live in hint.txt separated by this; must match agent/tools.py
@@ -190,6 +190,7 @@ PAGE = r"""<!doctype html>
     <div class="kinds">
       <button type="button" id="kind-general" data-kind="general">general</button>
       <button type="button" id="kind-forensics" data-kind="forensics">forensics</button>
+      <button type="button" id="kind-cryptography" data-kind="cryptography">cryptography</button>
     </div>
     <label for="name">ctf / challenge name (used for the log file)</label>
     <input id="name" autocomplete="off" spellcheck="false">
@@ -322,11 +323,12 @@ const fields = ["name", "host", "port", "desc", "flag", "steps", "model"];
 const DESC_HINT = {
   general: "",
   forensics: "paste the challenge text. the file you drop in section 02 is analysed in the sandbox.",
+  cryptography: "paste the challenge text, including any n / e / c numbers. drop ciphertext, key or image files in section 02.",
 };
 let kind = "general";
 
 function setKind(k) {
-  kind = k === "forensics" ? "forensics" : "general";
+  kind = ["forensics", "cryptography"].includes(k) ? k : "general";
   document.body.dataset.kind = kind;
   for (const b of document.querySelectorAll(".kinds button")) b.classList.toggle("on", b.dataset.kind === kind);
   $("desc").placeholder = DESC_HINT[kind];

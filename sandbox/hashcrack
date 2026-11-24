@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""hashcrack HASH [WORDLIST...] [--words WORD [WORD ...]] [--brute-digits N] [-o OUT]
+
+Dictionary-cracks a hex-encoded hash by trying candidate passwords and comparing digests.
+Nothing about the password is ever hardcoded: the algorithm is inferred purely from the
+hash's hex length, and candidates come only from wordlists / words you supply.
+
+HASH            hex digest (whitespace trimmed, case-insensitive). Length selects the
+                algorithm: 32=md5, 40=sha1, 56=sha224, 64=sha256, 96=sha384, 128=sha512.
+                Also accepts a file containing just the hash.
+WORDLIST...     one or more newline-separated wordlist files to try, in order given.
+                If none are given, every *.txt file under /usr/local/share/wordlists/
+                (installed in the sandbox image, e.g. rockyou.txt) is used automatically,
+                falling back to the small bundled list shipped next to this script.
+--words W...    extra literal candidate words to try first (e.g. words pulled from the
+                challenge text, filenames, or the service banner) - handy when the real
+                password is a proper noun or theme word a generic wordlist won't have.
+--brute-digits N   also try every N-digit all-numeric PIN (0..10**N-1), e.g. --brute-digits 4
+                for a 4-digit PIN. Off by default since it only fits numeric-only passwords.
+-o OUT          write the recovered password to OUT instead of just stdout.
+
+Prints "<algo> <password>" and exits 0 on success. Exits 1 with "NOT FOUND" if nothing in
+the given candidates matches. Exits 2 on a usage/input error (bad hash format).
+"""
+import argparse
+import hashlib
+import itertools
+import sys
+from pathlib import Path
+
+ALGOS_BY_LEN = {
+    32: "md5",
+    40: "sha1",
+    56: "sha224",
+    64: "sha256",
+    96: "sha384",
+    128: "sha512",
+}
+
+DEFAULT_WORDLIST_DIR = Path("/usr/local/share/wordlists")
+BUNDLED_FALLBACK = Path(__file__).resolve().parent.parent / "wordlists" / "10k-most-common.txt"
+
+
+def parse_hash(raw: str) -> str:
+    candidate = raw.strip()
+    p = Path(candidate)
+    if p.is_file():
+        candidate = p.read_text(errors="ignore").strip()
+    candidate = candidate.lower()
+    if not candidate or any(c not in "0123456789abcdef" for c in candidate):
+        raise ValueError(f"not a hex digest: {raw!r}")
+    if len(candidate) not in ALGOS_BY_LEN:
+        raise ValueError(f"unrecognized hash length {len(candidate)} (expected one of {sorted(ALGOS_BY_LEN)})")
+    return candidate
+
+
+def default_wordlists() -> list[Path]:
+    found = []
+    if DEFAULT_WORDLIST_DIR.is_dir():
+        found.extend(sorted(DEFAULT_WORDLIST_DIR.glob("*.txt")))
+    if not found and BUNDLED_FALLBACK.is_file():
+        found.append(BUNDLED_FALLBACK)
+    return found
+
+
+def candidates(wordlists: list[Path], extra_words: list[str], brute_digits: int):
+    seen = set()
+    for w in extra_words:
+        if w not in seen:
+            seen.add(w)
+            yield w
+    for wl in wordlists:
+        try:
+            with open(wl, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    word = line.rstrip("\r\n")
+                    if word and word not in seen:
+                        seen.add(word)
+                        yield word
+        except OSError:
+            continue
+    if brute_digits:
+        for n in range(10 ** brute_digits):
+            yield str(n).zfill(brute_digits)
+
+
+def crack(target_hash: str, wordlists: list[Path], extra_words: list[str], brute_digits: int):
+    algo = ALGOS_BY_LEN[len(target_hash)]
+    hasher_factory = getattr(hashlib, algo)
+    for word in candidates(wordlists, extra_words, brute_digits):
+        if hasher_factory(word.encode("utf-8", "surrogateescape")).hexdigest() == target_hash:
+            return algo, word
+    return algo, None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="hashcrack", add_help=True)
+    ap.add_argument("hash")
+    ap.add_argument("wordlists", nargs="*", type=Path)
+    ap.add_argument("--words", nargs="+", default=[])
+    ap.add_argument("--brute-digits", type=int, default=0)
+    ap.add_argument("-o", "--out")
+    args = ap.parse_args()
+
+    try:
+        target = parse_hash(args.hash)
+    except ValueError as e:
+        print(f"hash error: {e}", file=sys.stderr)
+        return 2
+
+    wordlists = args.wordlists if args.wordlists else default_wordlists()
+    algo, password = crack(target, wordlists, args.words, args.brute_digits)
+
+    if password is None:
+        print("NOT FOUND")
+        return 1
+
+    print(f"{algo} {password}")
+    if args.out:
+        Path(args.out).write_text(password)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

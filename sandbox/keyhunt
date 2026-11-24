@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""keyhunt FILE... [--pass WORD ...] [-o DIR] - hunt for hidden keys / secrets / flags inside challenge files.
+
+Looks (recursively, 2 layers deep) in: raw bytes, data appended after the end of PNG/JPEG/GIF, metadata
+(exiftool), steghide payloads (JPEG/BMP/WAV/AU; passphrases "", your --pass words and common guesses), and
+for PNG/BMP the least-significant bits of the pixels. In everything it finds, it looks for PEM/OpenSSH key
+blocks (also hidden inside base64 / hex / zlib), "n = ... e = ... d = ..." number lists, and flags.
+Everything extracted is saved in DIR (default /tmp/keyhunt). Pure python plus optional exiftool/steghide.
+"""
+import argparse
+import base64
+import binascii
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zlib
+
+PEM = re.compile(rb"-----BEGIN ([A-Z0-9 ]+)-----.+?-----END \1-----", re.S)
+FLAG = re.compile(rb"(academy|picoCTF)\{[^}]*\}", re.I)
+NUMS = re.compile(rb"(?im)^\W*([nedpq])\s*[:=]\s*(?:0x[0-9a-f]{8,}|\d{8,})")
+B64 = re.compile(rb"[A-Za-z0-9+/\s]{80,}={0,2}")
+HEXRUN = re.compile(rb"(?:[0-9a-fA-F]{2}[\s:]?){60,}")
+COMMON_PASS = ["", "password", "pass", "secret", "key", "flag", "rsa", "steg", "stego", "picoctf", "admin",
+               "123456", "private", "hidden", "keys", "lock", "unlock", "open", "letmein", "toor"]
+TRAILER = [(b"\xff\xd9", "JPEG EOI"), (b"IEND\xaeB`\x82", "PNG IEND"), (b"\x00;", "GIF trailer")]
+
+out_dir = "/tmp/keyhunt"
+seen = set()
+hits = []
+
+
+def say(msg):
+    print(msg, flush=True)
+
+
+def save(name, data):
+    os.makedirs(out_dir, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    path = os.path.join(out_dir, safe)
+    open(path, "wb").write(data)
+    return path
+
+
+def report_secrets(data, where):
+    """Look for key blocks / number lists / flags in data. Returns True if something was found."""
+    found = False
+    for i, m in enumerate(PEM.finditer(data)):
+        found = True
+        if m.group(0) in seen:
+            continue  # same block already reported from another view of the file
+        seen.add(m.group(0))
+        p = save(f"{where}_{i}.pem", m.group(0).replace(b"\r", b"") + b"\n")
+        say(f"  >>> KEY BLOCK ({m.group(1).decode()}) in {where} -> saved {p}")
+        hits.append(p)
+    if NUMS.search(data):
+        found = True
+        p = save(f"{where}_numbers.txt", data)
+        say(f"  >>> RSA-style number list (n/e/d/p/q) in {where} -> saved {p}")
+        hits.append(p)
+    for m in FLAG.finditer(data):
+        found = True
+        say(f"  >>> FLAG-SHAPED STRING in {where}: {m.group(0).decode(errors='replace')}")
+    return found
+
+
+def hidden_layers(data):
+    """Yield (label, bytes) for decoded views of data: base64 runs, hex runs, zlib streams."""
+    for i, m in enumerate(B64.finditer(data)):
+        try:
+            dec = base64.b64decode(re.sub(rb"\s+", b"", m.group(0)))
+        except Exception:
+            continue
+        if len(dec) >= 32:
+            yield f"b64[{i}]", dec
+    for i, m in enumerate(HEXRUN.finditer(data)):
+        try:
+            dec = binascii.unhexlify(re.sub(rb"[\s:]", b"", m.group(0)))
+        except Exception:
+            continue
+        yield f"hex[{i}]", dec
+    for i, m in enumerate(re.finditer(rb"\x78[\x01\x5e\x9c\xda]", data)):
+        try:
+            dec = zlib.decompressobj().decompress(data[m.start():])
+        except Exception:
+            continue
+        if len(dec) >= 32:
+            yield f"zlib[{i}]", dec
+
+
+def scan(data, where, depth=0):
+    found = report_secrets(data, where)
+    if depth < 2:
+        for label, dec in hidden_layers(data):
+            found = scan(dec, f"{where}.{label}", depth + 1) or found
+    return found
+
+
+def trailing(data, where):
+    """Data after the logical end of an image container."""
+    out = []
+    for marker, name in TRAILER[:2]:
+        i = data.rfind(marker)
+        if i >= 0 and data.startswith({b"\xff\xd9": b"\xff\xd8", b"IEND\xaeB`\x82": b"\x89PNG"}[marker]):
+            tail = data[i + len(marker):]
+            if len(tail.strip(b"\x00\r\n ")) > 0:
+                out.append((name, tail))
+    if data.startswith(b"GIF8"):
+        i = data.rfind(b"\x3b")
+        if 0 < i < len(data) - 1:
+            out.append(("GIF trailer", data[i + 1:]))
+    return out
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, **kw)
+
+
+def steghide(path, words, where):
+    if not shutil.which("steghide"):
+        say("  (steghide not installed; skipped)")
+        return []
+    head = open(path, "rb").read(12)
+    if not (head.startswith((b"\xff\xd8", b"BM", b".snd")) or (head[:4] == b"RIFF" and head[8:12] == b"WAVE")):
+        return []  # steghide only handles JPEG, BMP, WAV, AU
+    results = []
+    for w in words:
+        dest = os.path.join(out_dir, f"{where}_steghide_{re.sub(r'[^A-Za-z0-9]', '_', w) or 'emptypass'}")
+        os.makedirs(out_dir, exist_ok=True)
+        r = run(["steghide", "extract", "-sf", path, "-p", w, "-xf", dest, "-f"], timeout=60)
+        if r.returncode == 0 and os.path.exists(dest):
+            say(f"  >>> STEGHIDE EXTRACTED a payload with passphrase {w!r} -> {dest}")
+            results.append(dest)
+            break  # one passphrase opens it
+    if not results:
+        say(f"  steghide: nothing with {len(words)} passphrase(s) tried (empty, common words, --pass words)")
+    return results
+
+
+def lsb(path, where):
+    try:
+        from PIL import Image
+        import numpy as np
+    except Exception:
+        say("  (pillow/numpy missing; LSB check skipped)")
+        return
+    try:
+        arr = np.array(Image.open(path).convert("RGB"))
+    except Exception as e:
+        say(f"  LSB: cannot open as image ({e})")
+        return
+    flat = arr.reshape(-1, 3)
+    views = {"RGB interleaved": flat.reshape(-1), "R": flat[:, 0], "G": flat[:, 1], "B": flat[:, 2]}
+    any_hit = False
+    for name, ch in views.items():
+        for bitpos, bits_label in ((0, "lsb"),):
+            bits = (ch >> bitpos) & 1
+            for order in ("big", "little"):
+                n = len(bits) // 8 * 8
+                packed = np.packbits(bits[:n], bitorder=order).tobytes()
+                if scan(packed[:2_000_000], f"{where}_lsb_{name.split()[0]}_{order}"):
+                    any_hit = True
+    if not any_hit:
+        say("  LSB (RGB, R, G, B; msb-first and lsb-first): no key or flag found")
+
+
+def hunt(path, words, depth=0):
+    where = os.path.basename(path)
+    data = open(path, "rb").read()
+    say(f"\n=== {path} ({len(data)} bytes) ===")
+    say("  type: " + (run(["file", "-b", path], text=True).stdout.strip()[:100] or "?"))
+    found = scan(data, where)
+    if not found:
+        say("  raw / base64 / hex / zlib layers: no key block, number list or flag")
+    for name, tail in trailing(data, where):
+        say(f"  appended data after {name}: {len(tail)} bytes")
+        p = save(f"{where}_trailer.bin", tail)
+        say(f"    saved {p}; preview: {tail[:60]!r}")
+        scan(tail, f"{where}_trailer")
+    if shutil.which("exiftool"):
+        meta = run(["exiftool", "-a", "-u", "-G1", path], text=True, errors="replace").stdout
+        if scan(meta.encode(), f"{where}_exif"):
+            pass
+        else:
+            long_fields = [l for l in meta.splitlines() if len(l) > 120]
+            say(f"  metadata: no key block ({len(meta.splitlines())} fields)"
+                + (f"; {len(long_fields)} unusually long field(s), inspect: exiftool -a -u -G1" if long_fields else ""))
+    for sub in steghide(path, words, where):
+        if depth < 2:
+            sdata = open(sub, "rb").read()
+            say(f"  steghide payload: {len(sdata)} bytes, preview {sdata[:60]!r}")
+            if not scan(sdata, os.path.basename(sub)) and depth < 1 and re.search(rb"\x89PNG|\xff\xd8\xff|PK\x03\x04", sdata[:4]):
+                hunt(sub, words, depth + 1)
+    if data[:4] in (b"\x89PNG", b"BM6\x00") or data[:2] == b"BM":
+        lsb(path, where)
+
+
+def main():
+    global out_dir
+    ap = argparse.ArgumentParser(description="hunt for hidden keys in files")
+    ap.add_argument("files", nargs="+")
+    ap.add_argument("--pass", dest="words", action="append", default=[], help="extra steghide passphrase (repeatable)")
+    ap.add_argument("-o", dest="out", default=out_dir)
+    a = ap.parse_args()
+    out_dir = a.out
+    for f in a.files:
+        if not os.path.isfile(f):
+            say(f"not a file: {f}")
+            continue
+        stem = os.path.splitext(os.path.basename(f))[0]
+        words = list(dict.fromkeys(a.words + COMMON_PASS + [stem, stem.lower()]))
+        hunt(f, words)
+    say("\n=== SUMMARY ===")
+    if hits:
+        for h in dict.fromkeys(hits):
+            say(f"key material: {h}")
+        say("next: rsadec KEYFILE CIPHERTEXT_FILE   (also try --passphrase if it says the key is protected)")
+    else:
+        say("no key material found. Next: check the challenge text for passwords, rerun with --pass WORD, "
+            "try binwalk -e, exiftool, steghide with words from the description, or the other files given.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

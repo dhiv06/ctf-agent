@@ -55,7 +55,7 @@ MANUAL REFERENCE
     fls -r -p IMG > /tmp/files.txt ; wc -l /tmp/files.txt
     grep -v -E "[0-9]:\s(etc|usr|lib|bin|sbin|var/lib|var/cache|proc|sys|dev|boot)/" /tmp/files.txt | head -80
   Look first at user data: home/*, root, tmp, mnt, opt, srv, var/mail, var/log, anything unusual. Deleted entries are marked * (fls -r -d IMG lists only those).
-- fls lists a DIRECTORY BY INODE, not by path: fls -r -p IMG 64771 (the number from the listing). A path argument fails with "Error stat(ing) image file".
+- fls lists a DIRECTORY BY INODE, not by path: fls -r -p IMG DIR_INODE (the number from the listing). A path argument fails with "Error stat(ing) image file".
 - Reading: icat IMG INODE (file contents by inode, also works on deleted files); istat IMG INODE (timestamps, size, blocks). Bulk-extract everything incl. deleted: tsk_recover -a IMG /tmp/rec, then grep -r -a -i -E "academy\{" /tmp/rec and look at file names/contents.
 - ext2/3/4 alternative: debugfs -R "ls -l -d /" IMG, debugfs -R "cat /path" IMG, debugfs -R "lsdel" IMG. 7z x -o/tmp/ex IMG also unpacks many images.
 - Timestamps/timeline questions: fls -r -m / IMG > /tmp/body; mactime -b /tmp/body lists files by time. Compare mtime/ctime/crtime in istat; look for the odd one out (oldest, newest, modified after creation, timestamps in the future or out of pattern).
@@ -65,7 +65,7 @@ MANUAL REFERENCE
     tsk_recover -a IMG /tmp/rec ; find /tmp/rec -type f | head -50     extracts allocated AND deleted files
     jls IMG ; jcat IMG JOURNAL_INODE | strings | grep -i -E "flag|academy|\{"     ext3/4 journal keeps old copies of metadata and sometimes data
     strings -a -n 8 IMG | grep -i -E "flag|academy"     last resort over the whole image
-- debugfs syntax: one command per -R, a number must be written <INODE> (debugfs -R "ls -l <64771>" IMG, debugfs -R "stat <12>" IMG). There is no ls -R and no cd.
+- debugfs syntax: one command per -R, a number must be written <INODE> (debugfs -R "ls -l <DIR_INODE>" IMG, debugfs -R "stat <INODE>" IMG). There is no ls -R and no cd.
 - Nothing obvious: check hidden files and dirs (names starting with .), logs, shell history, config files, notes, other users' home dirs, trash, and file slack/unallocated space (blkls IMG | strings | grep).
 - If the flag text is not literal in the image, read the challenge description again: it may tell you to wrap/derive the flag from something you find (a timestamp, name, hash). Follow that.
 - foremost carving and `grep -a` on the raw image only find plain unfragmented data; prefer the filesystem tools above.

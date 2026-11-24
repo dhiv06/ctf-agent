@@ -29,7 +29,7 @@ Rebuild the image after editing anything in `sandbox/` or the `Dockerfile`.
 python dropui.py
 ```
 Open http://localhost:5000. Stdlib only, no Flask.
-- Pick the **challenge type**: *general* (skills `general,git`; host/port shown) or *forensics* (skills `general,forensics`; host/port hidden, a dropped file is required).
+- Pick the **challenge type**: *general* (skills `general,git`; host/port shown) *forensics* (skills `general,forensics`; host/port hidden, a dropped file is required), or *cryptography* (skills `general,cryptography`; for RSA/XOR/classical/hash challenges; drop ciphertext, key or image files and paste any n/e/c numbers in the description).
 - Fill in the description, optional flag/hints/max steps/model, drop challenge files, and run.
 - Dropped files go to `challenge/` and are copied into the sandbox's `/workspace`.
 
@@ -45,11 +45,11 @@ python agent/agent.py --description "..." [--flag FLAG] [--file PATH] [--skills 
 | `agent/agent.py` | CLI entry point and the model/tool loop; builds the system prompt, logs to JSON |
 | `agent/tools.py` | Tools the model can call (run commands in the sandbox, flag check, hints) |
 | `agent/prompts/core.txt` | Base system prompt, always loaded |
-| `agent/prompts/skills/` | Optional prompt modules: `general`, `git`, `forensics` (chosen via `--skills`) |
+| `agent/prompts/skills/` | Optional prompt modules: `general`, `git`, `forensics`, `cryptography` (chosen via `--skills`) |
 | `agent/requirements.txt` | Python dependencies |
 | `dropui.py` | Web UI + local server; starts sandbox, uploads files, launches the agent |
 | `Dockerfile` | Sandbox image: forensics/stego tools (binwalk, exiftool, steghide, tesseract, ...), git/ssh, netcat, Python libs |
-| `sandbox/` | Helper scripts installed in the sandbox: `triage FILE`, `bits2bytes FILE`, `ocr IMAGE` |
+| `sandbox/` | Helper scripts installed in the sandbox: `triage FILE`, `bits2bytes FILE`, `ocr IMAGE`, `diskscan IMG`, `keyhunt FILE...` (finds keys hidden in files/images), `rsadec KEY CIPHERTEXT` (RSA decryption with PKCS#1/OAEP/raw and weak-key attacks), `hashcrack HASH` (dictionary-cracks md5/sha1/sha224/sha256/sha384/sha512 hex digests against rockyou.txt, no password/algorithm ever hardcoded) |
 | `challenge/` | Files dropped via the UI (created at runtime) |
 | `workspace/` | Local fixtures/logs, e.g. `base64_warmup.txt` |
 | `tests/` | Mock tests, forensics checks, and real-model sanity scripts |
@@ -59,6 +59,7 @@ python agent/agent.py --description "..." [--flag FLAG] [--file PATH] [--skills 
 |---|---|---|
 | Mock loop (scripted fake model) | `python tests/test_mock.py` | nothing |
 | Skills, UI toggle, page JS, sandbox helpers | `python tests/test_forensics.py` | nothing |
+| Cryptography skill, `keyhunt`, `rsadec`, `hashcrack` (generated keys, no challenge data) | `python tests/test_cryptography.py` | nothing |
 | Sanity: base64 warmup | `powershell -File tests\run_sanity.ps1` | Docker sandbox + API key |
 | Sanity: forensics | `powershell -File tests\run_sanity_forensics.ps1` | Docker sandbox + API key |
 

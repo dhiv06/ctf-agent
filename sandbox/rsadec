@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""rsadec KEY CIPHERTEXT [-o OUT] [--passphrase P] - decrypt RSA with whatever key material you have.
+
+KEY         PEM/DER private key (PKCS#1, PKCS#8, OpenSSH unencrypted), PEM/DER public key, or a text file of
+            numbers such as "n = ...", "e = ...", "d = ...", "p = ...", "q = ..." (decimal or 0x hex).
+CIPHERTEXT  raw binary file, hex text, base64 text, or a decimal integer (file or literal). May also be the
+            same file as KEY when it contains "c = ...".
+Tries raw RSA, PKCS#1 v1.5 and OAEP (sha1/224/256/384/512), block by block, and reports readable results and
+any flag. With only a public key it tries: small prime trial division, Fermat (close primes), Wiener
+(small d) and an exact e-th root (tiny message / small e). Pure python, no dependencies.
+"""
+import argparse
+import base64
+import binascii
+import hashlib
+import math
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+FLAG = re.compile(rb"(academy|picoCTF)\{[^}]*\}", re.I)
+
+
+# ---------------------------------------------------------------- ASN.1 / key parsing
+def der_read(buf, pos=0):
+    """Return (tag, content_bytes, next_pos) of the TLV at pos."""
+    tag = buf[pos]
+    ln = buf[pos + 1]
+    pos += 2
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(buf[pos:pos + n], "big")
+        pos += n
+    if pos + ln > len(buf):
+        raise ValueError("truncated DER")
+    return tag, buf[pos:pos + ln], pos + ln
+
+
+def der_children(content):
+    out, pos = [], 0
+    while pos < len(content):
+        tag, body, pos = der_read(content, pos)
+        out.append((tag, body))
+    return out
+
+
+def der_ints(content):
+    return [int.from_bytes(b, "big") for t, b in der_children(content) if t == 0x02]
+
+
+def parse_der(der):
+    """Parse RSA key DER (PKCS#1 private/public, PKCS#8, SPKI) into a dict of integers."""
+    tag, body, _ = der_read(der)
+    if tag != 0x30:
+        raise ValueError("not a DER SEQUENCE")
+    kids = der_children(body)
+    ints = [t for t, _ in kids]
+    if all(t == 0x02 for t in ints):
+        v = [int.from_bytes(b, "big") for _, b in kids]
+        if len(v) == 2:  # RSAPublicKey
+            return {"n": v[0], "e": v[1]}
+        if len(v) >= 9:  # RSAPrivateKey: version n e d p q dp dq qinv
+            return {"n": v[1], "e": v[2], "d": v[3], "p": v[4], "q": v[5]}
+    if len(kids) >= 3 and kids[0][0] == 0x02 and kids[1][0] == 0x30 and kids[2][0] == 0x04:  # PKCS#8
+        return parse_der(kids[2][1])
+    if len(kids) == 2 and kids[0][0] == 0x30 and kids[1][0] == 0x03:  # SPKI
+        return parse_der(kids[1][1][1:])
+    raise ValueError("unrecognised key structure")
+
+
+def parse_openssh(blob):
+    if not blob.startswith(b"openssh-key-v1\x00"):
+        raise ValueError("not an OpenSSH key")
+    pos = len(b"openssh-key-v1\x00")
+
+    def s():
+        nonlocal pos
+        n = int.from_bytes(blob[pos:pos + 4], "big")
+        pos += 4
+        d = blob[pos:pos + n]
+        pos += n
+        return d
+
+    cipher, kdf = s(), s()
+    s()
+    nkeys = int.from_bytes(blob[pos:pos + 4], "big")
+    pos += 4
+    pub = s()
+    if cipher != b"none":
+        raise ValueError("OpenSSH key is encrypted (needs ssh-keygen -p; passphrase required)")
+    priv = s()
+    pos = 0
+    blob = priv[8:]  # skip the two check ints
+    pos = 0
+    if s() != b"ssh-rsa":
+        raise ValueError("OpenSSH key is not RSA")
+    n, e, d, _iqmp, p, q = (int.from_bytes(s(), "big") for _ in range(6))
+    return {"n": n, "e": e, "d": d, "p": p, "q": q}
+
+
+def num(tok):
+    tok = tok.strip().strip("'\"")
+    return int(tok, 16) if tok.lower().startswith("0x") else int(tok)
+
+
+def parse_numbers(text):
+    out = {}
+    for m in re.finditer(r"(?im)^\W*([nedpqc])\s*[:=]\s*(0x[0-9a-f]+|\d+)", text):
+        out.setdefault(m.group(1).lower(), num(m.group(2)))
+    return out
+
+
+def load_key(path, passphrase):
+    data = open(path, "rb").read()
+    text = data.decode("latin-1")
+    m = re.search(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", text, re.S)
+    if m:
+        kind, body = m.group(1), m.group(2)
+        if "ENCRYPTED" in kind or "Proc-Type: 4,ENCRYPTED" in body:
+            if not passphrase:
+                raise ValueError("key is passphrase-protected: rerun with --passphrase P (try passwords found elsewhere in the challenge)")
+            if not shutil.which("openssl"):
+                raise ValueError("encrypted key and no openssl in this environment")
+            with tempfile.NamedTemporaryFile(suffix=".pem") as t:
+                r = subprocess.run(["openssl", "rsa", "-in", path, "-passin", "pass:" + passphrase, "-out", t.name],
+                                   capture_output=True, text=True)
+                if r.returncode:
+                    raise ValueError("openssl could not decrypt the key: " + r.stderr.strip()[:200])
+                return load_key(t.name, "")
+        payload = re.sub(r"(?m)^[A-Za-z-]+:.*$", "", body)
+        raw = base64.b64decode(re.sub(r"\s+", "", payload))
+        return parse_openssh(raw) if kind == "OPENSSH PRIVATE KEY" else parse_der(raw)
+    if data[:1] == b"\x30":
+        try:
+            return parse_der(data)
+        except Exception:
+            pass
+    nums = parse_numbers(text)
+    if nums:
+        return nums
+    raise ValueError("could not read any RSA key or n/e/d/p/q numbers from " + path)
+
+
+# ---------------------------------------------------------------- ciphertext loading
+def load_cipher(arg):
+    try:
+        raw = open(arg, "rb").read()
+    except OSError:
+        raw = arg.encode()
+    s = raw.strip()
+    c = parse_numbers(raw.decode("latin-1")).get("c") if len(raw) < 100_000 else None
+    if c:  # a "c = ..." line inside a numbers file
+        return [("c from number file", c.to_bytes((c.bit_length() + 7) // 8, "big"))]
+    if s and re.fullmatch(rb"[0-9]+", s) and len(s) > 20:
+        return [("decimal", int(s).to_bytes((int(s).bit_length() + 7) // 8, "big"))]
+    if s and re.fullmatch(rb"(0x)?[0-9a-fA-F\s]+", s) and len(re.sub(rb"\s|0x", b"", s)) % 2 == 0 \
+            and len(s) >= 32 and re.search(rb"[a-fA-F]", s):
+        return [("hex text", binascii.unhexlify(re.sub(rb"\s|0x", b"", s)))]
+    if s and re.fullmatch(rb"[A-Za-z0-9+/=\s]+", s) and len(s) >= 40:
+        try:
+            return [("base64 text", base64.b64decode(re.sub(rb"\s+", b"", s), validate=True)), ("raw", raw)]
+        except Exception:
+            pass
+    return [("raw binary", raw)]
+
+
+# ---------------------------------------------------------------- math
+def isqrt(n):
+    return math.isqrt(n)
+
+
+def iroot(x, k):
+    lo, hi = 0, 1 << (x.bit_length() // k + 1)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if mid ** k <= x:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def fermat(n, rounds=2_000_000):
+    a = isqrt(n)
+    if a * a < n:
+        a += 1
+    for _ in range(rounds):
+        b2 = a * a - n
+        b = isqrt(b2)
+        if b * b == b2:
+            return a - b, a + b
+        a += 1
+    return None
+
+
+def trial(n, limit=2_000_000):
+    if n % 2 == 0:
+        return 2, n // 2
+    f = 3
+    while f < limit:
+        if n % f == 0:
+            return f, n // f
+        f += 2
+    return None
+
+
+def wiener(n, e):
+    a, b = e, n
+    cf = []
+    while b:
+        cf.append(a // b)
+        a, b = b, a % b
+    h0, h1, k0, k1 = 0, 1, 1, 0
+    for q in cf:
+        h0, h1 = h1, q * h1 + h0
+        k0, k1 = k1, q * k1 + k0
+        k, d = h1, k1
+        if k == 0 or (e * d - 1) % k:
+            continue
+        phi = (e * d - 1) // k
+        s = n - phi + 1
+        disc = s * s - 4 * n
+        if disc >= 0 and isqrt(disc) ** 2 == disc and (s + isqrt(disc)) % 2 == 0:
+            return d
+    return None
+
+
+def complete(key):
+    """Fill in d (and p, q) from whatever is known. Returns (key, notes)."""
+    notes = []
+    n, e = key.get("n"), key.get("e", 65537)
+    p, q = key.get("p"), key.get("q")
+    if n is None and p and q:
+        n = key["n"] = p * q
+    if p and not q and n:
+        key["q"] = q = n // p
+    if q and not p and n:
+        key["p"] = p = n // q
+    if "d" not in key and p and q and e:
+        key["d"] = pow(e, -1, math.lcm(p - 1, q - 1))
+        notes.append("computed d from p and q")
+    if "d" not in key and n and e:
+        notes.append("no private exponent: trying attacks on the public key")
+        f = trial(n) or fermat(n)
+        if f:
+            key["p"], key["q"] = f
+            key["d"] = pow(e, -1, math.lcm(f[0] - 1, f[1] - 1))
+            notes.append("FACTORED n (small prime / close primes)")
+        else:
+            d = wiener(n, e)
+            if d:
+                key["d"] = d
+                notes.append("recovered d with Wiener's attack (e is very large / d is small)")
+    return key, notes
+
+
+# ---------------------------------------------------------------- padding schemes
+def mgf1(seed, length, h):
+    out = b""
+    c = 0
+    while len(out) < length:
+        out += h(seed + c.to_bytes(4, "big")).digest()
+        c += 1
+    return out[:length]
+
+
+def unpad_pkcs1(em):
+    if len(em) > 11 and em[0] == 0 and em[1] == 2:
+        i = em.find(b"\x00", 2)
+        if i >= 10:
+            return em[i + 1:]
+    return None
+
+
+def unpad_oaep(em, h):
+    hl = h().digest_size
+    if len(em) < 2 * hl + 2 or em[0] != 0:
+        return None
+    seed = bytes(a ^ b for a, b in zip(em[1:1 + hl], mgf1(em[1 + hl:], hl, h)))
+    db = bytes(a ^ b for a, b in zip(em[1 + hl:], mgf1(seed, len(em) - hl - 1, h)))
+    if db[:hl] != h(b"").digest():
+        return None
+    i = db.find(b"\x01", hl)
+    if i < 0 or db[hl:i].strip(b"\x00"):
+        return None
+    return db[i + 1:]
+
+
+def readable(b):
+    return bool(b) and sum(1 for x in b if 32 <= x < 127 or x in (9, 10, 13)) / len(b) > 0.85
+
+
+def show(label, data, found):
+    flag = FLAG.search(data)
+    tag = "READABLE" if readable(data) else "binary"
+    print(f"[{label}] {tag}: {data[:160]!r}")
+    if flag:
+        print(f"    FLAG: {flag.group(0).decode(errors='replace')}")
+        found.append(flag.group(0))
+
+
+def decrypt(key, blob, out_path):
+    n, d = key["n"], key["d"]
+    k = (n.bit_length() + 7) // 8
+    print(f"modulus: {n.bit_length()} bits, block size {k} bytes, ciphertext {len(blob)} bytes")
+    if len(blob) % k and len(blob) < k:
+        blob = blob.rjust(k, b"\x00")
+    blocks = [blob[i:i + k].rjust(k, b"\x00") for i in range(0, len(blob), k)]
+    if len(blob) > k:
+        print(f"(ciphertext is {len(blocks)} blocks of {k} bytes, decrypted block by block)")
+    raws = [pow(int.from_bytes(b, "big"), d, n).to_bytes(k, "big") for b in blocks]
+    found, best = [], None
+    schemes = [("PKCS#1 v1.5", lambda em: unpad_pkcs1(em))] + \
+              [(f"OAEP {nm}", (lambda em, f=f: unpad_oaep(em, f)))
+               for nm, f in (("sha1", hashlib.sha1), ("sha256", hashlib.sha256),
+                             ("sha224", hashlib.sha224), ("sha384", hashlib.sha384), ("sha512", hashlib.sha512))]
+    for label, fn in schemes:
+        parts = [fn(em) for em in raws]
+        if all(p is not None for p in parts):
+            data = b"".join(parts)
+            show(label, data, found)
+            best = best if best is not None else data
+    raw = b"".join(r.lstrip(b"\x00") if len(raws) == 1 else r for r in raws)
+    show("raw / textbook RSA (no padding)", raw, found)
+    if best is None:
+        best = raw
+    if found:
+        best = found[0]
+    if out_path:
+        open(out_path, "wb").write(best)
+        print(f"wrote {out_path}")
+    return found
+
+
+def main():
+    ap = argparse.ArgumentParser(description="RSA decryption helper")
+    ap.add_argument("key")
+    ap.add_argument("cipher")
+    ap.add_argument("-o", dest="out", default="")
+    ap.add_argument("--passphrase", default="")
+    a = ap.parse_args()
+    try:
+        key = load_key(a.key, a.passphrase)
+    except Exception as ex:
+        sys.exit(f"key error: {ex}")
+    key, notes = complete(key)
+    print("key fields found:", ", ".join(k for k in "nedpq" if k in key))
+    for nt in notes:
+        print("note:", nt)
+    if "n" not in key:
+        sys.exit("no modulus n available")
+    if "d" not in key:
+        # e-th root: only works if the plaintext is tiny / no wraparound
+        e = key.get("e", 65537)
+        for lab, blob in load_cipher(a.cipher):
+            c = int.from_bytes(blob, "big")
+            m = iroot(c, e)
+            if m ** e == c:
+                data = m.to_bytes((m.bit_length() + 7) // 8, "big")
+                print(f"exact {e}-th root of c ({lab}) works (message was small):")
+                show("root", data, [])
+                return 0
+        sys.exit("cannot recover the private key from the public key alone with these quick attacks. "
+                 "Look for the private key / p / q / d elsewhere (keyhunt on every file), or try factoring n externally.")
+    ok = False
+    for lab, blob in load_cipher(a.cipher):
+        print(f"--- ciphertext read as {lab}")
+        ok = bool(decrypt(key, blob, a.out)) or ok
+        if ok:
+            break
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

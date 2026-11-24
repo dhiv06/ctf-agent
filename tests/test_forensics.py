@@ -39,6 +39,7 @@ def main() -> int:
 
     forensics = agent.build_system_prompt("general,forensics")
     default = agent.build_system_prompt(agent.DEFAULT_SKILLS)
+    all_skills = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "agent" / "prompts" / "skills").glob("*.txt"))
     page_js = re.search(r"<script>(.*?)</script>", dropui.PAGE, re.S).group(1)
     js_file = tmp / "page.js"
     js_file.write_text(page_js, encoding="utf-8")
@@ -57,9 +58,8 @@ def main() -> int:
         "forensics description omits server line": "nc h 1" not in dropui.build_description(task, "", ["f.bin"]),
         "general description keeps server line": "nc h 1" in dropui.build_description({**task, "kind": "general"}, "", []),
         "fixtures are never listed/wiped by the UI": {"base64_warmup.txt", "bits_warmup.bin"} <= dropui.IGNORED,
-        "forensics skill documents every sandbox helper": all(
-            f"- {h.name} " in forensics or f"- {h.name}:" in forensics or f"- {h.name} " in forensics
-            for h in (ROOT / "sandbox").iterdir()),
+        "skills document every sandbox helper": all(
+            f"- {h.name} " in all_skills or f"- {h.name}:" in all_skills for h in (ROOT / "sandbox").iterdir()),
         "Dockerfile installs every sandbox helper": all(
             f"sandbox/{h.name}" in (ROOT / "Dockerfile").read_text() for h in (ROOT / "sandbox").iterdir()),
         "page JS parses": js_ok,
